@@ -830,6 +830,15 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
         sender_task = asyncio.create_task(sender_worker())
         current_sentence_buf = ""
 
+        stream = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=conversation_history,
+            tools=TOOLS_SCHEMA,
+            tool_choice="auto",
+            stream=True,
+            temperature=0.7
+        )
+
         async for chunk in stream:
             if cancel_event.is_set():
                 break
