@@ -574,6 +574,7 @@
         }
 
         function playNextInQueue() {
+            if (currentAudio) return; // 当前有音频正在播放时，只排队，严禁抢占覆盖！
             if (audioQueue.length === 0) {
                 if (orb.classList.contains("speaking")) {
                     setVoiceState("listening", "等待您说话...");
