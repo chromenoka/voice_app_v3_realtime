@@ -752,27 +752,37 @@ def smart_split_tts(buf: str) -> tuple[str, str]:
 async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event):
     if cancel_event.is_set():
         return
-    # 过滤掉 URL 和代码块，只念自然语言部分
     clean_text = clean_text_for_tts(text)
     if not clean_text:
         return
-    # 【已回退】不再按句切片。原因：拆成 N 句 = N 次 edge-tts 网络请求，
-    # 每次都有 HTTP 往返延迟，句子之间播放队列容易「空窗」→ 一卡一卡。
-    # 整段一次合成只有 1 次网络请求，合成完一次性推送，前端播整段顺滑。
-    # 本机 CPU/内存充足，整段合成延迟可接受，体验比碎片化更稳。
     voice = detect_tts_voice(clean_text)
-    communicate = edge_tts.Communicate(clean_text, voice, rate=TTS_RATE)
-    audio_data = bytearray()
-    try:
-        async for chunk in communicate.stream():
-            if cancel_event.is_set():
-                return
-            if chunk["type"] == "audio":
-                audio_data.extend(chunk["data"])
-        if audio_data and not cancel_event.is_set():
-            await websocket.send_bytes(bytes(audio_data))
-    except Exception as e:
-        print(f"[TTS 错误]: {e}")
+    # Edge-TTS 重试机制：微软服务器偶发超时时自动重试 1 次
+    for attempt in range(2):
+        if cancel_event.is_set():
+            return
+        try:
+            communicate = edge_tts.Communicate(clean_text, voice, rate=TTS_RATE)
+            audio_data = bytearray()
+            async for chunk in communicate.stream():
+                if cancel_event.is_set():
+                    return
+                if chunk["type"] == "audio":
+                    audio_data.extend(chunk["data"])
+            if audio_data and not cancel_event.is_set():
+                try:
+                    await websocket.send_bytes(bytes(audio_data))
+                except Exception:
+                    pass  # WebSocket 已关闭，静默忽略
+            return  # 成功则直接返回
+        except Exception as e:
+            err = str(e)
+            if attempt == 0 and ("timeout" in err.lower() or "connection" in err.lower()):
+                print(f"[TTS 重试] 首次连接超时，1 秒后重试...")
+                await asyncio.sleep(1.0)
+                continue
+            elif "Cannot call" not in err and "No audio" not in err:
+                print(f"[TTS 错误]: {e}")
+            return
 
 
 async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asyncio.Event, is_typed: bool = False):
@@ -918,7 +928,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = message["bytes"]
                 audio_buffer.extend(data)
 
-                VOLUME_THRESHOLD = 300
+                VOLUME_THRESHOLD = 700   # 提高阈值：过滤键盘声/呼气/环境噪音
+                MIN_SPEECH_FRAMES = 15   # 提高连续帧要求：15帧≈450ms，过滤短促噪音
                 while len(audio_buffer) >= FRAME_SIZE:
                     frame = bytes(audio_buffer[:FRAME_SIZE])
                     audio_buffer = bytearray(audio_buffer[FRAME_SIZE:])
@@ -935,7 +946,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         silence_frames = 0
                         current_speech_buffer.extend(frame)
 
-                        if not is_speaking and speech_frames >= 8:
+                        if not is_speaking and speech_frames >= MIN_SPEECH_FRAMES:
                             is_speaking = True
                             await websocket.send_text("START")
                             cancel_event.set()
