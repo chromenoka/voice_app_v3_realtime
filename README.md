@@ -6,9 +6,9 @@
 
 ## 🎥 Demo Video / 演示動画
 
-> 💡 **Demo Video Placeholder**: Upload your short recorded `.mp4` or `.gif` demo video here!
->
-> ![Demo Video Placeholder](https://img.shields.io/badge/Demo_Video-Available-brightgreen)
+<video src="https://raw.githubusercontent.com/chromenoka/voice_app_v3_realtime/master/demo.mp4" controls width="100%"></video>
+
+> 🎬 **Direct Link**: [Watch / Download Real-Time Demo Video (demo.mp4)](./demo.mp4)
 
 ---
 
