@@ -84,5 +84,5 @@ See [CHANGELOG.md](./CHANGELOG.md) for full version history.
 ---
 
 ## 👤 Author / 開発者
-- **Dong Zhaote (董 趙特)**
-- Email: `aierxiusite@gmail.com`
+- **chromenoka**
+
