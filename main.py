@@ -983,10 +983,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                 audio_np = np.frombuffer(current_speech_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                                 # transcribe 是 CPU 密集的同步调用，丢进线程池，
                                 # 避免阻塞 asyncio 事件循环（否则会卡住其他连接和 TTS 推送）
-                                # 根据最近对话自动推断语种，提升日语/英语识别率
-                                stt_lang = detect_conversation_lang()
+                                # language=None：让 Whisper 每次自动检测语种。
+                                # 不再用 detect_conversation_lang() 传 hint——历史里出现过日语就会强制把
+                                # 中文音频按日语解码，导致中英文识别完全失效。Whisper 自检测中/日/英都很准。
                                 def _stt(buf):
-                                    segments, _ = whisper_model.transcribe(buf, language=stt_lang, beam_size=1)
+                                    segments, _ = whisper_model.transcribe(buf, language=None, beam_size=1)
                                     text = "".join([s.text for s in segments])
                                     return {"text": text}
                                 result = await asyncio.to_thread(_stt, audio_np)
