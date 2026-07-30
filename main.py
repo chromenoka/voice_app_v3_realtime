@@ -688,15 +688,17 @@ TTS_RATE = "+25%"
 
 
 def detect_tts_voice(text: str) -> str:
-    """
-    根据文本内容自动选择最合适的 TTS 声音。
-    - 含日文假名/大量日文汉字 → 日语声音 Nanami
-    - 含英文字母（且无中日字符）→ 英语声音 Jenny
-    - 默认 → 中文声音 Xiaoxiao
-    用「主要语言」判定，避免一句话里夹杂个别字符就切错声音。
-    """
-    if not text:
-        return TTS_VOICE_ZH
+    # 1. 假名（平假名/片假名）出现 → 铁证日语
+    if re.search(r'[぀-ゟ゠-ヿ]', text):
+        return TTS_VOICE_JA
+    # 2. 如果对话上下文为日语，即使这句全是汉字/标点，也优先用日文发音人
+    if detect_conversation_lang() == "ja":
+        return TTS_VOICE_JA
+    # 3. 纯英文 → 英语发音人
+    if not re.search(r'[一-鿿぀-ヿ]', text) and re.search(r'[A-Za-z]', text):
+        return TTS_VOICE_EN
+    # 4. 默认中文发音人
+    return TTS_VOICE_ZH
     # 日文假名（平假名 + 片假名）是日语的铁证，出现即按日语念
     if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):  # ひらがな + カタカナ
         return TTS_VOICE_JA
