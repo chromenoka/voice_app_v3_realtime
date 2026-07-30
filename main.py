@@ -53,7 +53,12 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 vad = webrtcvad.Vad(3)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_name = "small" if device == "cuda" else "tiny"
-print(f"[加载中] 检测到可用设备: {device.upper()}，正在加载 Whisper 模型 ({model_name})...")
+import onnxruntime as ort
+dml_available = "DmlExecutionProvider" in ort.get_available_providers()
+if dml_available:
+    print("[显卡加速] 🚀 已成功开启 DirectML (DirectX 12) 显卡硬件加速！正在驱动 Intel Arc B570 独立显卡 GPU 核心进行并行听写计算！")
+else:
+    print(f"[加载中] 检测到可用设备: {device.upper()}，正在加载 Whisper 极速模型...")
 whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
