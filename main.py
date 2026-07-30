@@ -694,17 +694,14 @@ TTS_RATE = "+25%"
 
 
 def detect_tts_voice(text: str) -> str:
-    """根据文本内容与对话上下文，自动选择最合适的 TTS 发音人"""
-    # 1. 假名（平假名/片假名）出现 → 铁证日语
+    """根据当前文本内容自动选择最合适的 TTS 发音人（不依赖历史上下文）"""
+    # 1. 平假名/片假名出现 → 铁证日语，用日文发音人
     if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
         return TTS_VOICE_JA
-    # 2. 如果对话上下文为日语，即使这句全是汉字/标点，也优先用日文发音人
-    if detect_conversation_lang() == "ja":
-        return TTS_VOICE_JA
-    # 3. 纯英文（无中日字符）→ 英语发音人
+    # 2. 纯英文（无中日字符）→ 英语发音人
     if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff]', text) and re.search(r'[A-Za-z]', text):
         return TTS_VOICE_EN
-    # 4. 默认中文发音人
+    # 3. 其余（含中文汉字等）→ 默认中文发音人
     return TTS_VOICE_ZH
 
 
