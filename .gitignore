@@ -1,0 +1,19 @@
+# 敏感密钥文件（绝不上传 GitHub）
+.env
+.env.local
+*.pem
+*.key
+
+# Python 编译与临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 本地运行日志与聊天历史
+chat_memory.json
+*.log
+nu_
+
+# 临时补丁与测试脚本
+_*
