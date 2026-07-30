@@ -6,9 +6,9 @@
 
 ## 🎥 Demo Video / 演示動画
 
-<video src="https://raw.githubusercontent.com/chromenoka/voice_app_v3_realtime/master/demo.mp4" controls width="100%"></video>
+[![Watch Demo Video](https://img.shields.io/badge/▶️_Watch_Demo_Video-Click_Here-brightgreen?style=for-the-badge)](./demo.mp4)
 
-> 🎬 **Direct Link**: [Watch / Download Real-Time Demo Video (demo.mp4)](./demo.mp4)
+> 🎬 **[Click here to watch / download the demo video (demo.mp4)](./demo.mp4)**
 
 ---
 
