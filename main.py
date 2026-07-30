@@ -6,7 +6,7 @@ import webrtcvad
 import uvicorn
 import asyncio
 import numpy as np
-import whisper
+from faster_whisper import WhisperModel
 import torch
 from openai import AsyncOpenAI
 import edge_tts
@@ -52,7 +52,7 @@ vad = webrtcvad.Vad(3)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_name = "small" if device == "cuda" else "tiny"
 print(f"[加载中] 检测到可用设备: {device.upper()}，正在加载 Whisper 模型 ({model_name})...")
-whisper_model = whisper.load_model(model_name, device=device)
+whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -790,7 +790,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     has_tool_calls = False
 
     # 句切分正则：碰到句号、问号、感叹号、换行符切分
-    sentence_delimiters = re.compile(r'([。！？!?\n]+)')
+    sentence_delimiters = re.compile(r'([。！？!?，,、\n]+)')
 
     tts_queue = asyncio.Queue()
     
@@ -1009,7 +1009,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 # 根据最近对话自动推断语种，提升日语/英语识别率
                                 stt_lang = detect_conversation_lang()
                                 def _stt(buf):
-                                    return whisper_model.transcribe(buf, fp16=False, language=stt_lang)
+                                    segments, _ = whisper_model.transcribe(buf, language=stt_lang, beam_size=1)
+text = "".join([s.text for s in segments])
+return {"text": text}
                                 result = await asyncio.to_thread(_stt, audio_np)
                                 text = result["text"].strip()
                                 # 移除单纯的标点符号幻觉
