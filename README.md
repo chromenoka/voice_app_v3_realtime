@@ -81,8 +81,3 @@ python main.py
 
 See [CHANGELOG.md](./CHANGELOG.md) for full version history.
 
----
-
-## 👤 Author / 開発者
-- **chromenoka**
-
