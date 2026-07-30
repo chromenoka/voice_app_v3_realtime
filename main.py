@@ -28,8 +28,8 @@ load_dotenv()
 # 修复 Windows 终端 GBK 编码问题（emoji 会崩）
 if os.name == "nt":
     import sys, io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 # === 可选依赖：剪贴板 ===
 try:
