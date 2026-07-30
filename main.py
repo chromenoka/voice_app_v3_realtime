@@ -67,7 +67,7 @@ HISTORY_FILE = "chat_memory.json"
 
 # system 提示词抽成常量，保证「新会话」与「加载老记忆」用的是同一份。
 # 关键：要求用用户提问的同种语言回复（日/中/英…），否则 TTS 选对声音也没用。
-SYSTEM_PROMPT = "你是一个高级人工智能管家。请用非常口语化、像真人聊天一样的话回复。重要：用户用什么语言提问，你就用同一种语言回复（用户说日语就用日语回，说中文就用中文回，说英语就用英语回）。如果处于语音通话模式，每次回答一两句话即可，越简短越好。如果是文字聊天模式，可以详细作答。你拥有工具调用能力。当用户的问题需要实时信息（天气、时间、搜索）或系统操作时，主动使用工具。"
+SYSTEM_PROMPT = "你是一个高级人工智能管家。请用非常口语化、像真人聊天一样的话回复。重要：用户用什么语言提问，你就用同一种语言回复。【语音模式铁律】：每次回答必须严格控制在2句话以内，绝对不允许超过50个字，越短越好，禁止分点列举。如果是文字聊天模式（用户没有说话），可以适当详细作答。你拥有工具调用能力，当用户的问题需要实时信息（天气、时间、搜索）或系统操作时，主动使用工具。"
 
 if os.path.exists(HISTORY_FILE):
     with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -786,27 +786,13 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     tool_calls_dict = {}
     has_tool_calls = False
 
-    # 句切分正则：碰到句号、问号、感叹号、换行符切分
-    sentence_delimiters = re.compile(r'([。！？!?\n]+)')
-
-    tts_queue = asyncio.Queue()
-    
-    async def tts_worker():
-        while True:
-            chunk_text = await tts_queue.get()
-            if chunk_text is None:
-                tts_queue.task_done()
-                break
-            if cancel_event.is_set():
-                tts_queue.task_done()
-                break
-            if chunk_text.strip():
-                await text_to_speech_stream(chunk_text, websocket, cancel_event)
-            tts_queue.task_done()
-
-    tts_worker_task = None
-
     try:
+        # ═══════════════════════════════════════════════════
+        # 架构说明：【单次TTS请求模型】
+        # LLM 流式输出期间只刷新字幕，LLM 结束后整段文本
+        # 做 1 次 Edge-TTS 请求，彻底消灭逐句停顿。
+        # N句 × 1次TTS = 1次网络往返（而非以前的 N次）
+        # ═══════════════════════════════════════════════════
         stream = await client.chat.completions.create(
             model="deepseek-chat",
             messages=conversation_history,
@@ -815,8 +801,6 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
             stream=True,
             temperature=0.7
         )
-
-        current_sentence_buf = ""
 
         async for chunk in stream:
             if cancel_event.is_set():
@@ -839,34 +823,19 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
             elif delta.content:
                 content = delta.content
                 full_content += content
-                
-                # 仅发送字幕
+                # 实时推送字幕，不触发 TTS
                 safe_delta = content.replace("\n", "\\n")
                 await websocket.send_text(f"TRANSCRIPT_AI:{safe_delta}")
 
-                if not has_tool_calls:
-                    # 启动 TTS 工作流
-                    if tts_worker_task is None:
-                        tts_worker_task = asyncio.create_task(tts_worker())
-                    
-                    current_sentence_buf += content
-                    sentence, current_sentence_buf = smart_split_tts(current_sentence_buf)
-                    if sentence.strip():
-                        tts_queue.put_nowait(sentence)
-
-        # ── 无工具调用：处理剩余文本并等待 TTS ──
+        # ── 无工具调用：整段文本一次性 TTS ──
         if not has_tool_calls:
-            if current_sentence_buf.strip():
-                tts_queue.put_nowait(current_sentence_buf)
-            if tts_worker_task is not None:
-                tts_queue.put_nowait(None)
-                await tts_queue.join()
-            
             if full_content and not cancel_event.is_set():
+                # 整段只做 1 次 Edge-TTS 请求，无停顿
+                await text_to_speech_stream(full_content, websocket, cancel_event)
                 conversation_history.append({"role": "assistant", "content": full_content})
                 save_memory()
 
-        # ── 有工具调用：执行工具 → 二次流式 → 按句 TTS ──
+        # ── 有工具调用：执行工具 → 二次流式 → 整段一次 TTS ──
         else:
             tool_calls_list = [
                 {"id": tc["id"], "type": "function",
@@ -895,7 +864,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
 
             await websocket.send_text("TOOL_DONE")
 
-            # 准备二次回答的 TTS 流水线
+            # 二次流式：收集完整回答，整段一次 TTS
             stream2 = await client.chat.completions.create(
                 model="deepseek-chat",
                 messages=conversation_history,
@@ -903,8 +872,6 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                 temperature=0.7
             )
             final_reply = ""
-            current_sentence_buf = ""
-            tts_worker_task2 = asyncio.create_task(tts_worker())
 
             async for chunk in stream2:
                 if cancel_event.is_set():
@@ -913,19 +880,9 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                 if d2:
                     final_reply += d2
                     await websocket.send_text(f"TRANSCRIPT_AI:{d2.replace(chr(10), chr(92)+'n')}")
-                    
-                    current_sentence_buf += d2
-                    sentence2, current_sentence_buf = smart_split_tts(current_sentence_buf)
-                    if sentence2.strip():
-                        tts_queue.put_nowait(sentence2)
-
-            if current_sentence_buf.strip():
-                tts_queue.put_nowait(current_sentence_buf)
-            
-            tts_queue.put_nowait(None)
-            await tts_queue.join()
 
             if final_reply and not cancel_event.is_set():
+                await text_to_speech_stream(final_reply, websocket, cancel_event)
                 conversation_history.append({"role": "assistant", "content": final_reply})
                 save_memory()
 
