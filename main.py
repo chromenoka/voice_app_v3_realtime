@@ -862,14 +862,16 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                         tts_worker_task = asyncio.create_task(tts_worker())
                     
                     current_sentence_buf += content
-                    parts = sentence_delimiters.split(current_sentence_buf)
-                    if len(parts) > 1:
-                        # 组装完整句子并送入队列
-                        for i in range(0, len(parts) - 1, 2):
-                            sentence = parts[i] + (parts[i+1] if i+1 < len(parts) else "")
-                            if sentence.strip():
-                                tts_queue.put_nowait(sentence)
-                        current_sentence_buf = parts[-1]
+                    # 智能长短句动态缓冲算法：
+                    # 1. 遇到句号/问号/感叹号/换行 → 立即切片
+                    # 2. 遇到逗号/顿号，且已积攒 >= 8 个字（形成完整分句） → 立即切片送 TTS，兼顾极速与自然语调
+                    match = re.search(r'([。！？!?\n]|(?<=[，,、])(?=.{2,}))', current_sentence_buf)
+                    if match and len(current_sentence_buf) >= 6:
+                        split_pos = match.end()
+                        sentence = current_sentence_buf[:split_pos]
+                        current_sentence_buf = current_sentence_buf[split_pos:]
+                        if sentence.strip():
+                            tts_queue.put_nowait(sentence)
 
         # ── 无工具调用：处理剩余文本并等待 TTS ──
         if not has_tool_calls:
