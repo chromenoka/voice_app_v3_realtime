@@ -1012,8 +1012,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 stt_lang = detect_conversation_lang()
                                 def _stt(buf):
                                     segments, _ = whisper_model.transcribe(buf, language=stt_lang, beam_size=1)
-text = "".join([s.text for s in segments])
-return {"text": text}
+                                    text = "".join([s.text for s in segments])
+                                    return {"text": text}
                                 result = await asyncio.to_thread(_stt, audio_np)
                                 text = result["text"].strip()
                                 # 移除单纯的标点符号幻觉
