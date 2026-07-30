@@ -422,12 +422,8 @@
                         setVoiceState("thinking", "🤔 整理结果中...");
 
                     } else if (event.data === "START") {
-                        if (currentAudio) {
-                            currentAudio.pause();
-                            currentAudio.currentTime = 0;
-                            currentAudio = null;
-                        }
-                        audioQueue = [];
+                        // 用户开始说话 → 立刻打断 AI 的音频播放
+                        stopAudio();
                         setVoiceState("listening", "🎙️ 听您说话中...");
                         vtUser.classList.add('hidden-text');
                         vtAi.classList.add('hidden-text');
@@ -530,12 +526,7 @@
             chatInput.value = '';
             
             // 如果这时候有新消息发送，立刻打断当前的语音播放，准备播放新语音
-            if (currentAudio) {
-                currentAudio.pause();
-                currentAudio.currentTime = 0;
-                currentAudio = null;
-            }
-            audioQueue = [];
+            stopAudio();
 
             addMessage('user', text);
 
@@ -570,19 +561,32 @@
             voiceStatusText.innerText = text;
         }
 
+        // 统一的停止音频函数，所有打断场景都走这里
+        function stopAudio() {
+            if (currentAudio) {
+                currentAudio.onended = null;  // 先解绑，防止 pause 后触发 playNext
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+                URL.revokeObjectURL(currentAudio.src);
+                currentAudio = null;
+            }
+            audioQueue = [];
+        }
+
         function playNextInQueue() {
-            if (currentAudio && !currentAudio.ended && !currentAudio.paused) return;
             if (audioQueue.length === 0) {
                 if (orb.classList.contains("speaking")) {
                     setVoiceState("listening", "等待您说话...");
                 }
                 return;
             }
-
             setVoiceState("speaking", "🔊 AI 正在说话... (您可以随时打断)");
             currentAudio = audioQueue.shift();
-            currentAudio.play();
-            currentAudio.onended = playNextInQueue;
+            currentAudio.onended = () => {
+                currentAudio = null;
+                playNextInQueue();
+            };
+            currentAudio.play().catch(() => {});
         }
 
         async function startVoiceMode() {
@@ -623,8 +627,7 @@
         }
 
         function stopVoiceMode() {
-            if (currentAudio) currentAudio.pause();
-            audioQueue = [];
+            stopAudio();
             if (processor) processor.disconnect();
             if (audioContext) audioContext.close();
             if (stream) stream.getTracks().forEach(track => track.stop());
@@ -646,12 +649,7 @@
         };
 
         interruptBtn.onclick = () => {
-            if (currentAudio) {
-                currentAudio.pause();
-                currentAudio.currentTime = 0;
-                currentAudio = null;
-            }
-            audioQueue = [];
+            stopAudio();
             setVoiceState("listening", "已打断，听您说话中...");
             vtAi.classList.add('hidden-text');
             if (ws && ws.readyState === WebSocket.OPEN) {
