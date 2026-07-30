@@ -13,7 +13,6 @@ import torch
 from openai import AsyncOpenAI
 import edge_tts
 import json
-import os
 import re
 import ast
 import subprocess
@@ -695,24 +694,17 @@ TTS_RATE = "+25%"
 
 
 def detect_tts_voice(text: str) -> str:
+    """根据文本内容与对话上下文，自动选择最合适的 TTS 发音人"""
     # 1. 假名（平假名/片假名）出现 → 铁证日语
-    if re.search(r'[぀-ゟ゠-ヿ]', text):
+    if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
         return TTS_VOICE_JA
     # 2. 如果对话上下文为日语，即使这句全是汉字/标点，也优先用日文发音人
     if detect_conversation_lang() == "ja":
         return TTS_VOICE_JA
-    # 3. 纯英文 → 英语发音人
-    if not re.search(r'[一-鿿぀-ヿ]', text) and re.search(r'[A-Za-z]', text):
-        return TTS_VOICE_EN
-    # 4. 默认中文发音人
-    return TTS_VOICE_ZH
-    # 日文假名（平假名 + 片假名）是日语的铁证，出现即按日语念
-    if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):  # ひらがな + カタカナ
-        return TTS_VOICE_JA
-    # 纯英文（只有拉丁字母+数字+标点，没有中日字符）→ 英语
+    # 3. 纯英文（无中日字符）→ 英语发音人
     if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff]', text) and re.search(r'[A-Za-z]', text):
         return TTS_VOICE_EN
-    # 其余（含中文汉字等）默认中文
+    # 4. 默认中文发音人
     return TTS_VOICE_ZH
 
 
@@ -720,45 +712,41 @@ def detect_conversation_lang() -> str | None:
     """
     从最近几轮对话中推断用户当前的主导语言。
     返回 whisper 支持的 language 代码（'ja'/'en'/'zh'/...），或 None（自动检测）。
-
-    场景：用户开始说日语后，后续句子 Whisper tiny 模型容易误识别成中文。
-    如果检测到最近对话含日文假名，就提示 Whisper 倾向日语，大幅提升识别率。
     """
-    # 取最近 6 条用户消息
     recent = [msg["content"] for msg in conversation_history[-12:]
               if msg.get("role") == "user" and msg.get("content")]
     if not recent:
         return None
-    # 拼接最近几条，统计字符类别
-    combined = "".join(recent[-3:])  # 只看最近 3 条，避免早期对话干扰
-    ja_count = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', combined))  # 假名
+    combined = "".join(recent[-3:])
+    ja_count = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', combined))
     en_count = len(re.findall(r'[A-Za-z]', combined))
     zh_count = len(re.findall(r'[\u4e00-\u9fff]', combined))
-    # 日语假名占比 > 15% → 倾向日语
     if ja_count > 0 and ja_count > len(combined) * 0.15:
         return "ja"
-    # 纯英文（无中日字符）→ 倾向英语
     if en_count > 0 and zh_count == 0 and ja_count == 0:
         return "en"
-    # 其余让 Whisper 自动检测
     return None
 
 
-def split_sentences(text: str) -> list:
+def smart_split_tts(buf: str) -> tuple[str, str]:
     """
-    把整段文字按中英文句号/问号/感叹号/换行切成短句。
-    用于 TTS 流式：第一句合成完立即推送，大幅降低首字延迟。
-    切完后保留原标点（朗读需要）。
+    智能分句函数：从缓冲区提取一个可以立即发送给 TTS 的句子。
+    规则：
+      - 遇到句号/问号/感叹号/换行 → 立即切片（任何长度）
+      - 遇到逗号/顿号 且 逗号前已有 >= 10 个字 → 切片（保留自然节奏）
+    返回 (可发送的句子, 剩余缓冲区)，若无法切分则返回 ('', buf)
     """
-    # 用正则在句末标点后插入分隔符，保留标点本身
-    # 匹配：。！？!?… 或连续换行
-    parts = re.split(r'(?<=[。！？!?…])|(?<=\n)', text)
-    sentences = []
-    for p in parts:
-        p = p.strip()
-        if p:
-            sentences.append(p)
-    return sentences or [text]
+    # 优先：遇到句末标点立即切
+    m = re.search(r'[。！？!?\n]', buf)
+    if m:
+        cut = m.end()
+        return buf[:cut], buf[cut:]
+    # 其次：逗号前积累了足够字数才切
+    m2 = re.search(r'[，,、]', buf)
+    if m2 and m2.start() >= 10:
+        cut = m2.end()
+        return buf[:cut], buf[cut:]
+    return '', buf
 
 
 async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event):
@@ -862,16 +850,9 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                         tts_worker_task = asyncio.create_task(tts_worker())
                     
                     current_sentence_buf += content
-                    # 智能长短句动态缓冲算法：
-                    # 1. 遇到句号/问号/感叹号/换行 → 立即切片
-                    # 2. 遇到逗号/顿号，且已积攒 >= 8 个字（形成完整分句） → 立即切片送 TTS，兼顾极速与自然语调
-                    match = re.search(r'([。！？!?\n]|(?<=[，,、])(?=.{2,}))', current_sentence_buf)
-                    if match and len(current_sentence_buf) >= 6:
-                        split_pos = match.end()
-                        sentence = current_sentence_buf[:split_pos]
-                        current_sentence_buf = current_sentence_buf[split_pos:]
-                        if sentence.strip():
-                            tts_queue.put_nowait(sentence)
+                    sentence, current_sentence_buf = smart_split_tts(current_sentence_buf)
+                    if sentence.strip():
+                        tts_queue.put_nowait(sentence)
 
         # ── 无工具调用：处理剩余文本并等待 TTS ──
         if not has_tool_calls:
@@ -934,13 +915,9 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     await websocket.send_text(f"TRANSCRIPT_AI:{d2.replace(chr(10), chr(92)+'n')}")
                     
                     current_sentence_buf += d2
-                    parts = sentence_delimiters.split(current_sentence_buf)
-                    if len(parts) > 1:
-                        for i in range(0, len(parts) - 1, 2):
-                            sentence = parts[i] + (parts[i+1] if i+1 < len(parts) else "")
-                            if sentence.strip():
-                                tts_queue.put_nowait(sentence)
-                        current_sentence_buf = parts[-1]
+                    sentence2, current_sentence_buf = smart_split_tts(current_sentence_buf)
+                    if sentence2.strip():
+                        tts_queue.put_nowait(sentence2)
 
             if current_sentence_buf.strip():
                 tts_queue.put_nowait(current_sentence_buf)
