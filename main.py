@@ -799,7 +799,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     has_tool_calls = False
 
     # 句切分正则：碰到句号、问号、感叹号、换行符切分
-    sentence_delimiters = re.compile(r'([。！？!?，,、\n]+)')
+    sentence_delimiters = re.compile(r'([。！？!?\n]+)')
 
     tts_queue = asyncio.Queue()
     
