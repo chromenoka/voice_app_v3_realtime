@@ -834,11 +834,35 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                 safe_delta = content.replace("\n", "\\n")
                 await websocket.send_text(f"TRANSCRIPT_AI:{safe_delta}")
 
-        # ── 无工具调用：整段文本一次性 TTS ──
+        # ── 无工具调用：按模式选 TTS 策略 ──
         if not has_tool_calls:
             if full_content and not cancel_event.is_set():
-                # 整段只做 1 次 Edge-TTS 请求，无停顿
-                await text_to_speech_stream(full_content, websocket, cancel_event)
+                if is_typed:
+                    # 文字模式：AI 回答可能很长，用逐句流式 TTS，用户听到第一句只需等第一句合成完
+                    tts_queue = asyncio.Queue()
+                    async def tts_worker_text():
+                        while True:
+                            chunk_text = await tts_queue.get()
+                            if chunk_text is None:
+                                tts_queue.task_done()
+                                break
+                            if not cancel_event.is_set() and chunk_text.strip():
+                                await text_to_speech_stream(chunk_text, websocket, cancel_event)
+                            tts_queue.task_done()
+                    tts_task = asyncio.create_task(tts_worker_text())
+                    buf = ""
+                    for ch in full_content:
+                        buf += ch
+                        sentence, buf = smart_split_tts(buf)
+                        if sentence.strip():
+                            tts_queue.put_nowait(sentence)
+                    if buf.strip():
+                        tts_queue.put_nowait(buf)
+                    tts_queue.put_nowait(None)
+                    await tts_queue.join()
+                else:
+                    # 语音模式：AI 被限制在 2 句以内，整段一次 TTS，消灭句间停顿
+                    await text_to_speech_stream(full_content, websocket, cancel_event)
                 conversation_history.append({"role": "assistant", "content": full_content})
                 save_memory()
 
@@ -925,8 +949,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = message["bytes"]
                 audio_buffer.extend(data)
 
-                VOLUME_THRESHOLD = 700   # 提高阈值：过滤键盘声/呼气/环境噪音
-                MIN_SPEECH_FRAMES = 15   # 提高连续帧要求：15帧≈450ms，过滤短促噪音
+                VOLUME_THRESHOLD = 450   # 经验值：键盘声≈200-400 RMS，正常说话≈400-1200 RMS
+                MIN_SPEECH_FRAMES = 12   # 12帧≈360ms，过滤短促噪音同时不误杀正常语速
                 while len(audio_buffer) >= FRAME_SIZE:
                     frame = bytes(audio_buffer[:FRAME_SIZE])
                     audio_buffer = bytearray(audio_buffer[FRAME_SIZE:])
