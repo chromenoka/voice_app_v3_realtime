@@ -746,40 +746,43 @@ def smart_split_tts(buf: str) -> tuple[str, str]:
     return '', buf
 
 
-async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event):
+async def synthesize_tts_bytes(text: str, cancel_event: asyncio.Event) -> bytes:
+    """合成单句 TTS 并返回字节，含重试逻辑"""
     if cancel_event.is_set():
-        return
+        return b""
     clean_text = clean_text_for_tts(text)
     if not clean_text:
-        return
+        return b""
     voice = detect_tts_voice(clean_text)
-    # Edge-TTS 重试机制：微软服务器偶发超时时自动重试 1 次
     for attempt in range(2):
         if cancel_event.is_set():
-            return
+            return b""
         try:
             communicate = edge_tts.Communicate(clean_text, voice, rate=TTS_RATE)
             audio_data = bytearray()
             async for chunk in communicate.stream():
                 if cancel_event.is_set():
-                    return
+                    return b""
                 if chunk["type"] == "audio":
                     audio_data.extend(chunk["data"])
-            if audio_data and not cancel_event.is_set():
-                try:
-                    await websocket.send_bytes(bytes(audio_data))
-                except Exception:
-                    pass  # WebSocket 已关闭，静默忽略
-            return  # 成功则直接返回
+            return bytes(audio_data)
         except Exception as e:
             err = str(e)
             if attempt == 0 and ("timeout" in err.lower() or "connection" in err.lower()):
-                print(f"[TTS 重试] 首次连接超时，1 秒后重试...")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 continue
-            elif "Cannot call" not in err and "No audio" not in err:
-                print(f"[TTS 错误]: {e}")
-            return
+            return b""
+    return b""
+
+
+async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event):
+    """单段文本直接合成发送"""
+    audio_data = await synthesize_tts_bytes(text, cancel_event)
+    if audio_data and not cancel_event.is_set():
+        try:
+            await websocket.send_bytes(audio_data)
+        except Exception:
+            pass
 
 
 async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asyncio.Event, is_typed: bool = False):
@@ -800,14 +803,32 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
         # 做 1 次 Edge-TTS 请求，彻底消灭逐句停顿。
         # N句 × 1次TTS = 1次网络往返（而非以前的 N次）
         # ═══════════════════════════════════════════════════
-        stream = await client.chat.completions.create(
-            model="deepseek-chat",
-            messages=conversation_history,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
-            stream=True,
-            temperature=0.7
-        )
+        # ═══════════════════════════════════════════════════
+        # 高性能并发预加载 TTS 流水线 (Parallel Prefetch TTS Pipeline)
+        # LLM 流式吐字时，切出句子立刻启动异步预合成任务；
+        # 发送端 Worker 依次等待 Task 结果推送，实现「秒开首字 + 零停顿无缝播放」。
+        # ═══════════════════════════════════════════════════
+        prefetch_queue = asyncio.Queue()
+
+        async def sender_worker():
+            while True:
+                task = await prefetch_queue.get()
+                if task is None:
+                    prefetch_queue.task_done()
+                    break
+                if cancel_event.is_set():
+                    prefetch_queue.task_done()
+                    break
+                try:
+                    audio_bytes = await task
+                    if audio_bytes and not cancel_event.is_set():
+                        await websocket.send_bytes(audio_bytes)
+                except Exception:
+                    pass
+                prefetch_queue.task_done()
+
+        sender_task = asyncio.create_task(sender_worker())
+        current_sentence_buf = ""
 
         async for chunk in stream:
             if cancel_event.is_set():
@@ -830,39 +851,27 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
             elif delta.content:
                 content = delta.content
                 full_content += content
-                # 实时推送字幕，不触发 TTS
                 safe_delta = content.replace("\n", "\\n")
                 await websocket.send_text(f"TRANSCRIPT_AI:{safe_delta}")
 
-        # ── 无工具调用：按模式选 TTS 策略 ──
+                if not has_tool_calls:
+                    current_sentence_buf += content
+                    sentence, current_sentence_buf = smart_split_tts(current_sentence_buf)
+                    if sentence.strip():
+                        # 立刻并行发起 TTS 预合成 Task！
+                        t = asyncio.create_task(synthesize_tts_bytes(sentence, cancel_event))
+                        prefetch_queue.put_nowait(t)
+
+        # 处理剩余句子
         if not has_tool_calls:
+            if current_sentence_buf.strip():
+                t = asyncio.create_task(synthesize_tts_bytes(current_sentence_buf, cancel_event))
+                prefetch_queue.put_nowait(t)
+            
+            prefetch_queue.put_nowait(None)
+            await prefetch_queue.join()
+
             if full_content and not cancel_event.is_set():
-                if is_typed:
-                    # 文字模式：AI 回答可能很长，用逐句流式 TTS，用户听到第一句只需等第一句合成完
-                    tts_queue = asyncio.Queue()
-                    async def tts_worker_text():
-                        while True:
-                            chunk_text = await tts_queue.get()
-                            if chunk_text is None:
-                                tts_queue.task_done()
-                                break
-                            if not cancel_event.is_set() and chunk_text.strip():
-                                await text_to_speech_stream(chunk_text, websocket, cancel_event)
-                            tts_queue.task_done()
-                    tts_task = asyncio.create_task(tts_worker_text())
-                    buf = ""
-                    for ch in full_content:
-                        buf += ch
-                        sentence, buf = smart_split_tts(buf)
-                        if sentence.strip():
-                            tts_queue.put_nowait(sentence)
-                    if buf.strip():
-                        tts_queue.put_nowait(buf)
-                    tts_queue.put_nowait(None)
-                    await tts_queue.join()
-                else:
-                    # 语音模式：AI 被限制在 2 句以内，整段一次 TTS，消灭句间停顿
-                    await text_to_speech_stream(full_content, websocket, cancel_event)
                 conversation_history.append({"role": "assistant", "content": full_content})
                 save_memory()
 
