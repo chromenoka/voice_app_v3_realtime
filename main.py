@@ -932,11 +932,12 @@ async def websocket_endpoint(websocket: WebSocket):
     is_speaking = False
     silence_frames = 0
     speech_frames = 0
-    # 【极限加速优化】：将判定用户闭嘴的延迟从 450ms 缩小到 300ms (10帧)
-    MAX_SILENCE_FRAMES = 10
+    # 750ms 的停顿分割阈值：自然语速语语内停顿最長约50ms-400ms，设 25 帧(750ms)绝过多数情况
+    MAX_SILENCE_FRAMES = 25
 
     current_speech_buffer = bytearray()
     cancel_event = asyncio.Event()
+    current_llm_task: asyncio.Task | None = None  # 跟踪当前 LLM 任务，防止并发重复
 
     try:
         while True:
@@ -969,8 +970,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         if not is_speaking and speech_frames >= MIN_SPEECH_FRAMES:
                             is_speaking = True
+                            silence_frames = 0
                             await websocket.send_text("START")
+                            # 打断并取消旧任务，防止并发重复播放
                             cancel_event.set()
+                            if current_llm_task and not current_llm_task.done():
+                                current_llm_task.cancel()
                     else:
                         speech_frames = 0
                         if is_speaking:
@@ -1005,7 +1010,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                 if len(clean_text) > 0 and not is_hallucination:
                                     cancel_event.clear()
-                                    asyncio.create_task(process_llm_and_tts(text, websocket, cancel_event, is_typed=False))
+                                    speech_frames = 0  # 重置计数器，防止剩余帧重复触发
+                                    current_llm_task = asyncio.create_task(
+                                        process_llm_and_tts(text, websocket, cancel_event, is_typed=False)
+                                    )
                                 else:
                                     if len(clean_text) > 0:
                                         print(f"[静音/幻觉过滤] 过滤掉疑似 Whisper 幻觉文本: '{text}'")
