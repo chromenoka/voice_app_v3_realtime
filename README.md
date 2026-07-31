@@ -6,9 +6,9 @@
 
 ## 🎥 Demo Video / 演示動画
 
-[![Watch Demo Video](https://img.shields.io/badge/▶️_Watch_Demo_Video-Click_Here-brightgreen?style=for-the-badge)](./demo.mp4)
+![Real-Time Voice AI Agent Demo](./demo.gif)
 
-> 🎬 **[Click here to watch / download the demo video (demo.mp4)](./demo.mp4)**
+> 📥 **[点击直接下载 / 观看 1080P 高清演示视频 (demo.mp4)](https://github.com/chromenoka/voice_app_v3_realtime/raw/master/demo.mp4)**
 
 ---
 
