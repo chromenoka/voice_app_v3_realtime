@@ -99,7 +99,7 @@ def save_memory():
 def clean_text_for_tts(text: str) -> str:
     """过滤掉 URL、代码块等不适合 TTS 朗读的内容"""
     # 去除 URL
-    text = re.sub(r'https?://\S+', '链接', text)
+    text = re.sub(r'https?://\S+', '', text)
     # 去除 Markdown 代码块 ```
     text = re.sub(r'```[\s\S]*?```', '', text)
     # 去除行内代码 ` `
@@ -107,6 +107,21 @@ def clean_text_for_tts(text: str) -> str:
     # 去除 Markdown 粗体/斜体标记
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    # 去除 emoji 表情符号（防止 TTS 用错误语言朗读 emoji 描述文本）
+    # 注意：必须用逐个独立范围，不能用跨 BMP-SMP 的大区间（会把 CJK 汉字全删掉）
+    text = re.sub(
+        '['
+        '\U0001F600-\U0001F64F'   # Emoticons
+        '\U0001F300-\U0001F5FF'   # Misc Symbols & Pictographs
+        '\U0001F680-\U0001F6FF'   # Transport & Map
+        '\U0001F1E0-\U0001F1FF'   # Flags
+        '\U0001F900-\U0001F9FF'   # Supplemental Symbols
+        '\U0001FA00-\U0001FA6F'   # Chess Symbols
+        '\U0001FA70-\U0001FAFF'   # Symbols Extended-A
+        '\U00002600-\U000027BF'   # Misc Symbols + Dingbats
+        '\U0000FE00-\U0000FE0F'   # Variation Selectors
+        '‍'                   # Zero Width Joiner (emoji 组合用)
+        ']+', '', text)
     return text.strip()
 
 
@@ -693,15 +708,23 @@ TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_RATE = "+25%"
 
 
-def detect_tts_voice(text: str) -> str:
-    """根据当前文本内容自动选择最合适的 TTS 发音人（不依赖历史上下文）"""
+def detect_tts_voice(text: str, hint: str | None = None) -> str:
+    """根据当前文本内容 + 对话语言提示，自动选择最合适的 TTS 发音人
+
+    hint: 由 detect_conversation_lang() 提供的对话语言（'ja'/'en'/None），
+          用于处理纯 emoji / 纯符号等无法从文字本身判断语种的文本片段。"""
     # 1. 平假名/片假名出现 → 铁证日语，用日文发音人
     if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
         return TTS_VOICE_JA
     # 2. 纯英文（无中日字符）→ 英语发音人
     if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff]', text) and re.search(r'[A-Za-z]', text):
         return TTS_VOICE_EN
-    # 3. 其余（含中文汉字等）→ 默认中文发音人
+    # 3. 无法从文字判断时（纯 emoji / 纯符号 / 数字），使用对话语言提示
+    if hint == 'ja':
+        return TTS_VOICE_JA
+    if hint == 'en':
+        return TTS_VOICE_EN
+    # 4. 其余（含中文汉字等）→ 默认中文发音人
     return TTS_VOICE_ZH
 
 
@@ -746,14 +769,14 @@ def smart_split_tts(buf: str) -> tuple[str, str]:
     return '', buf
 
 
-async def synthesize_tts_bytes(text: str, cancel_event: asyncio.Event) -> bytes:
+async def synthesize_tts_bytes(text: str, cancel_event: asyncio.Event, hint: str | None = None) -> bytes:
     """合成单句 TTS 并返回字节，含重试逻辑"""
     if cancel_event.is_set():
         return b""
     clean_text = clean_text_for_tts(text)
     if not clean_text:
         return b""
-    voice = detect_tts_voice(clean_text)
+    voice = detect_tts_voice(clean_text, hint=hint)
     for attempt in range(2):
         if cancel_event.is_set():
             return b""
@@ -775,9 +798,9 @@ async def synthesize_tts_bytes(text: str, cancel_event: asyncio.Event) -> bytes:
     return b""
 
 
-async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event):
+async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event, hint: str | None = None):
     """单段文本直接合成发送"""
-    audio_data = await synthesize_tts_bytes(text, cancel_event)
+    audio_data = await synthesize_tts_bytes(text, cancel_event, hint=hint)
     if audio_data and not cancel_event.is_set():
         try:
             await websocket.send_bytes(audio_data)
@@ -795,6 +818,8 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     full_content = ""
     tool_calls_dict = {}
     has_tool_calls = False
+    # 提前检测对话语种，作为 TTS 发音人选择的兜底（解决纯 emoji / 符号片段误判为中文的问题）
+    tts_hint = detect_conversation_lang()
 
     try:
         # ═══════════════════════════════════════════════════
@@ -868,13 +893,13 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     sentence, current_sentence_buf = smart_split_tts(current_sentence_buf)
                     if sentence.strip():
                         # 立刻并行发起 TTS 预合成 Task！
-                        t = asyncio.create_task(synthesize_tts_bytes(sentence, cancel_event))
+                        t = asyncio.create_task(synthesize_tts_bytes(sentence, cancel_event, hint=tts_hint))
                         prefetch_queue.put_nowait(t)
 
         # 处理剩余句子
         if not has_tool_calls:
             if current_sentence_buf.strip():
-                t = asyncio.create_task(synthesize_tts_bytes(current_sentence_buf, cancel_event))
+                t = asyncio.create_task(synthesize_tts_bytes(current_sentence_buf, cancel_event, hint=tts_hint))
                 prefetch_queue.put_nowait(t)
             
             prefetch_queue.put_nowait(None)
@@ -931,7 +956,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     await websocket.send_text(f"TRANSCRIPT_AI:{d2.replace(chr(10), chr(92)+'n')}")
 
             if final_reply and not cancel_event.is_set():
-                await text_to_speech_stream(final_reply, websocket, cancel_event)
+                await text_to_speech_stream(final_reply, websocket, cancel_event, hint=tts_hint)
                 conversation_history.append({"role": "assistant", "content": final_reply})
                 save_memory()
 
