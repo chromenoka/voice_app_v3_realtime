@@ -1,6 +1,6 @@
-# Full-Duplex Real-Time Voice AI Agent System (voice_app_v3_realtime)
+# Low-Latency Voice AI Agent with Barge-In Control (voice_app_v3_realtime)
 
-> A low-latency, full-duplex conversational AI agent with real-time audio streaming, VAD barge-in interruption, single-request Edge-TTS synthesis, DeepSeek LLM Function Calling (11 tools), and AST sandbox security evaluation.
+> A browser-based voice AI agent with continuous microphone streaming, VAD-based turn detection, barge-in playback cancellation, streamed LLM text, path-aware Edge-TTS synthesis, DeepSeek Function Calling (11 tools), and AST sandbox security evaluation.
 
 ---
 
@@ -17,13 +17,13 @@
 1. **ASR Inference Decoupling (`asyncio.to_thread`)**
    - Offloads Whisper ASR inference to a thread pool to avoid blocking the main asyncio event loop.
 
-2. **Single-Request TTS Architecture (v0.5.0+)**
-   - Collects the complete LLM response first, then issues exactly **one** Edge-TTS HTTP request for the whole reply — eliminating the inter-sentence pauses caused by N sequential requests in the original sentence-split approach.
-   - Includes automatic retry logic for Microsoft TTS server connection timeouts.
+2. **Path-Aware TTS Pipeline**
+   - Ordinary, tool-free voice replies split streamed LLM output at safe clause boundaries and pre-synthesize segments concurrently for ordered playback.
+   - Replies after a tool call are collected and synthesized in one Edge-TTS request to avoid unnecessary inter-segment pauses.
 
-3. **True VAD Barge-In Interruption (v0.6.0+)**
-   - When user speech is detected (volume > 700 RMS, sustained ≥ 450 ms), the backend sends a `START` signal.
-   - The frontend's unified `stopAudio()` immediately unbinds the `onended` callback, pauses and revokes the current audio, and clears the queue — achieving genuine real-time interruption.
+3. **VAD-Triggered Barge-In Playback Control**
+   - Sustained user speech detected by WebRTC VAD plus an RMS gate sends a `START` signal and cancels the current LLM/TTS task.
+   - The frontend stops the active audio element, revokes its URL, and clears queued audio. The project does not claim a formally measured full-duplex system.
 
 4. **AST Sandbox Security Evaluation (`_safe_eval`)**
    - Completely removes `eval()`, implementing custom AST tree evaluation for safe arithmetic and DoS protection.
@@ -44,18 +44,20 @@
                                                               │
               ┌───────────────────────────────────────────────┴──────────────────────────────┐
               ▼                                               ▼                              ▼
-   [webrtcvad (VAD)]                            [Whisper ASR (Thread Pool)]      [DeepSeek LLM Agent]
-   Volume + Freq gate                            Audio → Text (asyncio.to_thread)  Function Calling (11 Tools)
-   700 RMS / 15 frames                                                                      │
+   [webrtcvad + RMS gate]                       [faster-whisper (Thread Pool)]  [DeepSeek LLM Agent]
+   Turn detection                                Audio → Text (asyncio.to_thread)  Function Calling (11 Tools)
+   configurable threshold / frames                                                           │
               │                                                                             ▼
-              │ START signal ──────────────────────────────────────────────► [Edge-TTS (single request)]
-              ▼                                                                  1 HTTP conn / full reply
+              │ START signal ──────────────────────────────────────────────► [Edge-TTS (path-aware)]
+              ▼                                                          normal: segments; tool: full reply
    [Frontend stopAudio()]                                                                   │
    Unbind onended → pause → revoke URL                                                     ▼
                                                                                [WebSocket send_bytes]
                                                                                Frontend Audio() plays
 ```
 
+
+`main.py` currently initializes `faster-whisper` as `tiny / CPU / int8`. Intel Arc / DirectML acceleration is not claimed because the active CTranslate2 inference path does not use it.
 ---
 
 ## 🚀 Quick Start / 起動方法

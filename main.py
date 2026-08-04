@@ -9,7 +9,6 @@ import uvicorn
 import asyncio
 import numpy as np
 from faster_whisper import WhisperModel
-import torch
 from openai import AsyncOpenAI
 import edge_tts
 import json
@@ -58,15 +57,13 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 vad = webrtcvad.Vad(3)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "small" if device == "cuda" else "tiny"
-import onnxruntime as ort
-dml_available = "DmlExecutionProvider" in ort.get_available_providers()
-if dml_available:
-    print("[显卡加速] 🚀 已成功开启 DirectML (DirectX 12) 显卡硬件加速！正在驱动 Intel Arc B570 独立显卡 GPU 核心进行并行听写计算！")
-else:
-    print(f"[加载中] 检测到可用设备: {device.upper()}，正在加载 Whisper 极速模型...")
-whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+# The active faster-whisper/CTranslate2 path uses CPU int8 inference. Do not
+# report ONNX Runtime or DirectML availability as Whisper GPU acceleration.
+ASR_DEVICE = "cpu"
+ASR_COMPUTE_TYPE = "int8"
+ASR_MODEL_NAME = "tiny"
+print(f"[ASR] faster-whisper {ASR_MODEL_NAME} | {ASR_DEVICE.upper()} | {ASR_COMPUTE_TYPE}")
+whisper_model = WhisperModel(ASR_MODEL_NAME, device=ASR_DEVICE, compute_type=ASR_COMPUTE_TYPE)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")

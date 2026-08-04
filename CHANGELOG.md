@@ -7,7 +7,7 @@
 
 ## [0.6.0] - 2026-07-31
 
-本轮针对「语音打断」与「噪音误触发」做集中修复，实现了真正的实时打断机制。
+本轮针对「语音打断」与「噪音误触发」做集中修复，实现了 VAD 触发的播放打断控制机制。
 
 ### 🐛 问题修复
 
@@ -128,7 +128,7 @@
 ## [0.3.0] 及更早
 
 - V3 多模态版本：Whisper + DeepSeek（含 11 个 Function Calling 工具）+ edge-TTS。
-- 全双工实时语音：Web Audio API + WebSocket + webrtcvad 端点检测。
+- 持续音频采集与 VAD 端点检测：Web Audio API + WebSocket + webrtcvad。
 - 工具调用可视化：前端通过 `TOOL_CALL` / `TOOL_DONE` 消息驱动光球变色与齿轮动画。
 - 对话记忆持久化：`chat_memory.json`，超 100 条自动滚动截断。
 

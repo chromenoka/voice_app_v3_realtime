@@ -372,7 +372,7 @@
 
             ws.onmessage = (event) => {
                 if (event.data instanceof ArrayBuffer) {
-                    // 后端整段合成完一次性发送，收到即播放即可。
+                    // 后端按回复路径发送已完成的音频段；前端按接收顺序依次播放。
                     const blob = new Blob([event.data], { type: 'audio/mp3' });
                     const audio = new Audio(URL.createObjectURL(blob));
                     audio.onended = function() { URL.revokeObjectURL(audio.src); };
@@ -535,7 +535,7 @@
         chatInput.onkeypress = (e) => { if (e.key === 'Enter') sendTextChat(); };
 
         // ==========================
-        // 3. 语音通话全双工逻辑 (WebSocket + WebAudio)
+        // 3. 持续采集与可打断语音交互 (WebSocket + Web Audio)
         // ==========================
         let isVoiceMode = false;
         let audioContext;
