@@ -8,7 +8,7 @@
 
 ![Real-Time Voice AI Agent Demo](./demo.gif)
 
-> 📥 **[点击直接下载 / 观看 1080P 高清演示视频 (demo.mp4)](https://github.com/chromenoka/voice_app_v3_realtime/raw/master/demo.mp4)**
+> 📥 **[演示動画 1080P  (demo.mp4)](https://github.com/chromenoka/voice_app_v3_realtime/raw/master/demo.mp4)**
 
 ---
 
