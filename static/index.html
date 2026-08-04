@@ -452,7 +452,7 @@
             wrap.className = `message ${role}`;
 
             if (role === 'ai') {
-                // AI：头像 + 无背景文档流 + 停止语音图标
+                // AI：头像 + 无背景文档流 + 按需朗读按钮
                 const avatar = document.createElement('span');
                 avatar.className = 'avatar';
                 avatar.textContent = '✻';
@@ -462,20 +462,10 @@
                 
                 const audioIcon = document.createElement('span');
                 audioIcon.className = 'stop-audio-icon';
-                audioIcon.innerHTML = '⏸️';
-                audioIcon.title = '暂停/打断此语音';
+                audioIcon.innerHTML = '🔊';
+                audioIcon.title = '朗读前两句';
                 audioIcon.onclick = () => {
-                    if (currentAudio) {
-                        currentAudio.pause();
-                        currentAudio.currentTime = 0;
-                        currentAudio = null;
-                    }
-                    audioQueue = [];
-                    audioIcon.innerHTML = '🔇';
-                    audioIcon.title = '已暂停';
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'interrupt' }));
-                    }
+                    speakMessage(bubble.innerText);
                 };
 
                 wrap.appendChild(avatar);
@@ -561,8 +551,34 @@
             voiceStatusText.innerText = text;
         }
 
+        function getSpeakableText(text) {
+            let clean = text
+                .replace(/```[\s\S]*?```/g, ' ')
+                .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+                .replace(/^\s{0,3}#{1,6}\s*/gm, '')
+                .replace(/^\s*(?:[-*+]|>)\s*/gm, '')
+                .replace(/[*_~#>`|]/g, '')
+                .replace(/https?:\/\/\S+/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const sentences = clean.match(/[^。！？!?\n]+[。！？!?]?/g) || [];
+            return sentences.slice(0, 2).join('').trim().slice(0, 120);
+        }
+
+        function speakMessage(text) {
+            const spoken = getSpeakableText(text);
+            if (!spoken || !('speechSynthesis' in window)) return;
+            stopAudio();
+            const utterance = new SpeechSynthesisUtterance(spoken);
+            if (/[\u3040-\u30ff]/.test(spoken)) utterance.lang = 'ja-JP';
+            else if (!/[\u3400-\u9fff]/.test(spoken) && /[A-Za-z]/.test(spoken)) utterance.lang = 'en-US';
+            else utterance.lang = 'zh-CN';
+            window.speechSynthesis.speak(utterance);
+        }
+
         // 统一的停止音频函数，所有打断场景都走这里
         function stopAudio() {
+            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
             if (currentAudio) {
                 currentAudio.onended = null;  // 先解绑，防止 pause 后触发 playNext
                 currentAudio.pause();

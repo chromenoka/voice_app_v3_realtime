@@ -22,6 +22,14 @@ import httpx
 import audioop  # 提前导入，避免热循环中重复 import
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from token_budget import (
+    build_request_messages,
+    compact_tool_result,
+    estimate_tokens,
+    output_token_limit,
+    remove_tool_exchange,
+    select_tool_schemas,
+)
 load_dotenv()
 
 # 修复 Windows 终端 GBK 编码问题（emoji 会崩）
@@ -65,9 +73,9 @@ client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.co
 
 HISTORY_FILE = "chat_memory.json"
 
-# system 提示词抽成常量，保证「新会话」与「加载老记忆」用的是同一份。
-# 关键：要求用用户提问的同种语言回复（日/中/英…），否则 TTS 选对声音也没用。
-SYSTEM_PROMPT = "你是一个高级人工智能管家。请用非常口语化、像真人聊天一样的话回复。重要：用户用什么语言提问，你就用同一种语言回复。【语音模式铁律】：每次回答必须严格控制在2句话以内，绝对不允许超过50个字，越短越好，禁止分点列举。如果是文字聊天模式（用户没有说话），可以适当详细作答。你拥有工具调用能力，当用户的问题需要实时信息（天气、时间、搜索）或系统操作时，主动使用工具。"
+# 稳定、紧凑的基础提示词始终放在最前面，便于服务端复用前缀缓存。
+# 语音/文字模式的长度规则在每轮请求中单独追加，避免模型猜测输入来源。
+SYSTEM_PROMPT = "你是多语言语音助手。始终用用户语言回答。只输出纯文本，禁止Markdown、标题和列表。在提供工具时按需调用；不得编造工具结果。"
 
 if os.path.exists(HISTORY_FILE):
     with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -98,6 +106,8 @@ def save_memory():
 
 def clean_text_for_tts(text: str) -> str:
     """过滤掉 URL、代码块等不适合 TTS 朗读的内容"""
+    # Markdown 链接只保留可读文字
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
     # 去除 URL
     text = re.sub(r'https?://\S+', '', text)
     # 去除 Markdown 代码块 ```
@@ -107,6 +117,10 @@ def clean_text_for_tts(text: str) -> str:
     # 去除 Markdown 粗体/斜体标记
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    # 去除标题、列表、引用和残留 Markdown 符号，避免 TTS 朗读“星号”等格式字符
+    text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*(?:[-*+]|>)\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[*_~#>|]+', '', text)
     # 去除 emoji 表情符号（防止 TTS 用错误语言朗读 emoji 描述文本）
     # 注意：必须用逐个独立范围，不能用跨 BMP-SMP 的大区间（会把 CJK 汉字全删掉）
     text = re.sub(
@@ -122,7 +136,7 @@ def clean_text_for_tts(text: str) -> str:
         '\U0000FE00-\U0000FE0F'   # Variation Selectors
         '‍'                   # Zero Width Joiner (emoji 组合用)
         ']+', '', text)
-    return text.strip()
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 # ============================================================
@@ -812,6 +826,21 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     global conversation_history
     conversation_history.append({"role": "user", "content": text})
 
+    # 只发送最近若干轮上下文；普通聊天不再携带全部 11 个工具定义。
+    request_messages = build_request_messages(
+        SYSTEM_PROMPT,
+        conversation_history,
+        is_typed=is_typed,
+    )
+    selected_tools = select_tool_schemas(text, TOOLS_SCHEMA)
+    max_output_tokens = output_token_limit(is_typed)
+    estimated_input = estimate_tokens(request_messages, selected_tools)
+    print(
+        f"[Token预算] mode={'text' if is_typed else 'voice'} "
+        f"history={max(0, len(request_messages)-2)} tools={len(selected_tools)} "
+        f"input≈{estimated_input} max_output={max_output_tokens}"
+    )
+
     if not is_typed:
         await websocket.send_text(f"TRANSCRIPT_USER:{text}")
 
@@ -855,14 +884,17 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
         sender_task = asyncio.create_task(sender_worker())
         current_sentence_buf = ""
 
-        stream = await client.chat.completions.create(
-            model="deepseek-chat",
-            messages=conversation_history,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
-            stream=True,
-            temperature=0.7
-        )
+        request_kwargs = {
+            "model": "deepseek-chat",
+            "messages": request_messages,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": max_output_tokens,
+        }
+        if selected_tools:
+            request_kwargs["tools"] = selected_tools
+            request_kwargs["tool_choice"] = "auto"
+        stream = await client.chat.completions.create(**request_kwargs)
 
         async for chunk in stream:
             if cancel_event.is_set():
@@ -888,7 +920,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                 safe_delta = content.replace("\n", "\\n")
                 await websocket.send_text(f"TRANSCRIPT_AI:{safe_delta}")
 
-                if not has_tool_calls:
+                if not is_typed and not has_tool_calls:
                     current_sentence_buf += content
                     sentence, current_sentence_buf = smart_split_tts(current_sentence_buf)
                     if sentence.strip():
@@ -904,6 +936,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
             
             prefetch_queue.put_nowait(None)
             await prefetch_queue.join()
+            await sender_task
 
             if full_content and not cancel_event.is_set():
                 conversation_history.append({"role": "assistant", "content": full_content})
@@ -911,16 +944,22 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
 
         # ── 有工具调用：执行工具 → 二次流式 → 整段一次 TTS ──
         else:
+            # 工具分支不会使用预取队列，也要结束 worker，避免后台任务泄漏。
+            prefetch_queue.put_nowait(None)
+            await prefetch_queue.join()
+            await sender_task
             tool_calls_list = [
                 {"id": tc["id"], "type": "function",
                  "function": {"name": tc["name"], "arguments": tc["arguments"]}}
                 for tc in tool_calls_dict.values()
             ]
-            conversation_history.append({
+            assistant_tool_message = {
                 "role": "assistant",
                 "content": full_content or None,
                 "tool_calls": tool_calls_list
-            })
+            }
+            conversation_history.append(assistant_tool_message)
+            tool_followup_messages = [*request_messages, assistant_tool_message]
 
             for tc in tool_calls_dict.values():
                 cn_name = TOOL_NAMES_CN.get(tc["name"], tc["name"])
@@ -929,21 +968,24 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     tool_args = json.loads(tc["arguments"])
                 except json.JSONDecodeError:
                     tool_args = {}
-                tool_result = await execute_tool(tc["name"], tool_args)
-                conversation_history.append({
+                tool_result = compact_tool_result(await execute_tool(tc["name"], tool_args))
+                tool_message = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": tool_result
-                })
+                }
+                conversation_history.append(tool_message)
+                tool_followup_messages.append(tool_message)
 
             await websocket.send_text("TOOL_DONE")
 
             # 二次流式：收集完整回答，整段一次 TTS
             stream2 = await client.chat.completions.create(
                 model="deepseek-chat",
-                messages=conversation_history,
+                messages=tool_followup_messages,
                 stream=True,
-                temperature=0.7
+                temperature=0.7,
+                max_tokens=max_output_tokens,
             )
             final_reply = ""
 
@@ -956,7 +998,12 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     await websocket.send_text(f"TRANSCRIPT_AI:{d2.replace(chr(10), chr(92)+'n')}")
 
             if final_reply and not cancel_event.is_set():
-                await text_to_speech_stream(final_reply, websocket, cancel_event, hint=tts_hint)
+                if not is_typed:
+                    await text_to_speech_stream(final_reply, websocket, cancel_event, hint=tts_hint)
+                remove_tool_exchange(
+                    conversation_history,
+                    {tc["id"] for tc in tool_calls_dict.values()},
+                )
                 conversation_history.append({"role": "assistant", "content": final_reply})
                 save_memory()
 
