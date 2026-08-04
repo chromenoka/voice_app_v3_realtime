@@ -53,6 +53,17 @@
    [Frontend stopAudio()]                                                                   │
    Unbind onended → pause → revoke URL                                                     ▼
                                                                                [WebSocket send_bytes]
+
+## Voice-turn latency experiment markers
+
+For accepted voice turns, the server writes one JSON line prefixed with `[Latency]`.
+The record uses a monotonic clock and includes the VAD turn-end to ASR-done,
+first-LLM-text, first-TTS-segment-ready, first-audio-sent, and terminal-response
+milestones. `boundary` is always `server_websocket_send`: it does not measure
+browser queueing, decode, or audible playback time.
+
+Records distinguish the `direct` and `tool` reply paths, and report `completed`,
+`cancelled`, or `error`. They are instrumentation for controlled experiments,
                                                                                Frontend Audio() plays
 ```
 

@@ -29,6 +29,7 @@ from token_budget import (
     remove_tool_exchange,
     select_tool_schemas,
 )
+from latency_metrics import TurnLatencyTrace
 load_dotenv()
 
 # 修复 Windows 终端 GBK 编码问题（emoji 会崩）
@@ -809,17 +810,33 @@ async def synthesize_tts_bytes(text: str, cancel_event: asyncio.Event, hint: str
     return b""
 
 
-async def text_to_speech_stream(text: str, websocket: WebSocket, cancel_event: asyncio.Event, hint: str | None = None):
+async def text_to_speech_stream(
+    text: str,
+    websocket: WebSocket,
+    cancel_event: asyncio.Event,
+    hint: str | None = None,
+    latency_trace: TurnLatencyTrace | None = None,
+):
     """单段文本直接合成发送"""
     audio_data = await synthesize_tts_bytes(text, cancel_event, hint=hint)
     if audio_data and not cancel_event.is_set():
         try:
+            if latency_trace:
+                latency_trace.mark("tts_first_segment_ready")
             await websocket.send_bytes(audio_data)
+            if latency_trace:
+                latency_trace.mark("audio_first_segment_sent")
         except Exception:
             pass
 
 
-async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asyncio.Event, is_typed: bool = False):
+async def process_llm_and_tts(
+    text: str,
+    websocket: WebSocket,
+    cancel_event: asyncio.Event,
+    is_typed: bool = False,
+    latency_trace: TurnLatencyTrace | None = None,
+):
     global conversation_history
     conversation_history.append({"role": "user", "content": text})
 
@@ -847,6 +864,7 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     # 提前检测对话语种，作为 TTS 发音人选择的兜底（解决纯 emoji / 符号片段误判为中文的问题）
     tts_hint = detect_conversation_lang()
 
+    outcome = "completed"
     try:
         # ═══════════════════════════════════════════════════
         # 架构说明：【单次TTS请求模型】
@@ -873,7 +891,11 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                 try:
                     audio_bytes = await task
                     if audio_bytes and not cancel_event.is_set():
+                        if latency_trace:
+                            latency_trace.mark("tts_first_segment_ready")
                         await websocket.send_bytes(audio_bytes)
+                        if latency_trace:
+                            latency_trace.mark("audio_first_segment_sent")
                 except Exception:
                     pass
                 prefetch_queue.task_done()
@@ -891,6 +913,8 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
         if selected_tools:
             request_kwargs["tools"] = selected_tools
             request_kwargs["tool_choice"] = "auto"
+        if latency_trace:
+            latency_trace.mark("llm_request_started")
         stream = await client.chat.completions.create(**request_kwargs)
 
         async for chunk in stream:
@@ -912,6 +936,8 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                         tool_calls_dict[idx]["arguments"] += tc_delta.function.arguments
 
             elif delta.content:
+                if latency_trace:
+                    latency_trace.mark("llm_first_text")
                 content = delta.content
                 full_content += content
                 safe_delta = content.replace("\n", "\\n")
@@ -991,12 +1017,20 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
                     break
                 d2 = chunk.choices[0].delta.content
                 if d2:
+                    if latency_trace:
+                        latency_trace.mark("llm_first_text")
                     final_reply += d2
                     await websocket.send_text(f"TRANSCRIPT_AI:{d2.replace(chr(10), chr(92)+'n')}")
 
             if final_reply and not cancel_event.is_set():
                 if not is_typed:
-                    await text_to_speech_stream(final_reply, websocket, cancel_event, hint=tts_hint)
+                    await text_to_speech_stream(
+                        final_reply,
+                        websocket,
+                        cancel_event,
+                        hint=tts_hint,
+                        latency_trace=latency_trace,
+                    )
                 remove_tool_exchange(
                     conversation_history,
                     {tc["id"] for tc in tool_calls_dict.values()},
@@ -1007,8 +1041,17 @@ async def process_llm_and_tts(text: str, websocket: WebSocket, cancel_event: asy
     except Exception as e:
         print(f"[大模型处理错误]: {e}")
 
+        outcome = "error"
 
 
+
+    finally:
+        if latency_trace:
+            latency_trace.mark("response_done")
+            latency_trace.emit(
+                path="tool" if has_tool_calls else "direct",
+                outcome="cancelled" if cancel_event.is_set() else outcome,
+            )
 
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
@@ -1072,6 +1115,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 is_speaking = False
                                 await websocket.send_text("END")
 
+                                latency_trace = TurnLatencyTrace()
+                                latency_trace.mark("turn_end")
                                 audio_np = np.frombuffer(current_speech_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                                 # transcribe 是 CPU 密集的同步调用，丢进线程池，
                                 # 避免阻塞 asyncio 事件循环（否则会卡住其他连接和 TTS 推送）
@@ -1083,6 +1128,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     text = "".join([s.text for s in segments])
                                     return {"text": text}
                                 result = await asyncio.to_thread(_stt, audio_np)
+                                latency_trace.mark("asr_done")
                                 text = result["text"].strip()
                                 # 移除单纯的标点符号幻觉
                                 clean_text = text.strip(' .。!！?？,，\n\t~')
@@ -1099,7 +1145,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                     cancel_event.clear()
                                     speech_frames = 0  # 重置计数器，防止剩余帧重复触发
                                     current_llm_task = asyncio.create_task(
-                                        process_llm_and_tts(text, websocket, cancel_event, is_typed=False)
+                                        process_llm_and_tts(
+                                            text, websocket, cancel_event,
+                                            is_typed=False,
+                                            latency_trace=latency_trace,
+                                        )
                                     )
                                 else:
                                     if len(clean_text) > 0:
