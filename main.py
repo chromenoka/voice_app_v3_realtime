@@ -29,6 +29,7 @@ from token_budget import (
     remove_tool_exchange,
     select_tool_schemas,
 )
+from image_utils import validate_and_normalize_image
 from latency_metrics import TurnLatencyTrace
 load_dotenv()
 
@@ -65,10 +66,22 @@ ASR_COMPUTE_TYPE = "int8"
 ASR_MODEL_NAME = "tiny"
 print(f"[ASR] faster-whisper {ASR_MODEL_NAME} | {ASR_DEVICE.upper()} | {ASR_COMPUTE_TYPE}")
 whisper_model = WhisperModel(ASR_MODEL_NAME, device=ASR_DEVICE, compute_type=ASR_COMPUTE_TYPE)
+VAD_VOLUME_THRESHOLD = 450
+VAD_MIN_SPEECH_FRAMES = 12
+VAD_MAX_SILENCE_FRAMES = 25
+
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
+VISION_API_KEY = os.getenv("VISION_API_KEY", "")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", "")
+VISION_MODEL = os.getenv("VISION_MODEL", "")
+vision_client = (
+    AsyncOpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL)
+    if VISION_API_KEY and VISION_BASE_URL and VISION_MODEL
+    else None
+)
 HISTORY_FILE = "chat_memory.json"
 
 # 稳定、紧凑的基础提示词始终放在最前面，便于服务端复用前缀缓存。
@@ -866,17 +879,10 @@ async def process_llm_and_tts(
 
     outcome = "completed"
     try:
-        # ═══════════════════════════════════════════════════
-        # 架构说明：【单次TTS请求模型】
-        # LLM 流式输出期间只刷新字幕，LLM 结束后整段文本
-        # 做 1 次 Edge-TTS 请求，彻底消灭逐句停顿。
-        # N句 × 1次TTS = 1次网络往返（而非以前的 N次）
-        # ═══════════════════════════════════════════════════
-        # ═══════════════════════════════════════════════════
-        # 高性能并发预加载 TTS 流水线 (Parallel Prefetch TTS Pipeline)
-        # LLM 流式吐字时，切出句子立刻启动异步预合成任务；
-        # 发送端 Worker 依次等待 Task 结果推送，实现「秒开首字 + 零停顿无缝播放」。
-        # ═══════════════════════════════════════════════════
+        # 普通回答：LLM 流式输出期间按安全停顿切分，并异步预合成 TTS。
+        # 发送端按原始文本顺序等待并推送已完成的音频片段。
+        # 工具调用后的最终回答：收集完整文本后整体合成。
+        # 预合成任务与发送端分离，保持文本顺序而不宣称端到端播放延迟。
         prefetch_queue = asyncio.Queue()
 
         async def sender_worker():
@@ -1053,6 +1059,40 @@ async def process_llm_and_tts(
                 outcome="cancelled" if cancel_event.is_set() else outcome,
             )
 
+async def process_vision_and_tts(text: str, image_data_url: str, websocket: WebSocket, cancel_event: asyncio.Event, is_typed: bool = False):
+    """Use the configured vision model for a request with the session image."""
+    if vision_client is None:
+        await websocket.send_text("TRANSCRIPT_AI:图片已附加，但视觉模型尚未配置。")
+        return
+    messages = [
+        {"role": "system", "content": "你是多语言视觉语音助手。根据图片和用户问题回答；只输出纯文本。"},
+        {"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]},
+    ]
+    try:
+        stream = await vision_client.chat.completions.create(
+            model=VISION_MODEL, messages=messages, stream=True, temperature=0.7,
+            max_tokens=output_token_limit(is_typed),
+        )
+        answer = ""
+        async for chunk in stream:
+            if cancel_event.is_set():
+                break
+            delta = chunk.choices[0].delta.content
+            if delta:
+                answer += delta
+                await websocket.send_text(f"TRANSCRIPT_AI:{delta.replace(chr(10), chr(92) + 'n')}")
+        if answer and not cancel_event.is_set():
+            conversation_history.append({"role": "user", "content": f"[image attached] {text}"})
+            conversation_history.append({"role": "assistant", "content": answer})
+            save_memory()
+            if not is_typed:
+                await text_to_speech_stream(answer, websocket, cancel_event, hint=detect_conversation_lang())
+    except Exception:
+        await websocket.send_text("TRANSCRIPT_AI:视觉模型请求失败，请检查视觉模型配置。")
+
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1063,12 +1103,13 @@ async def websocket_endpoint(websocket: WebSocket):
     silence_frames = 0
     speech_frames = 0
     # 750ms 的停顿分割阈值：自然语速语语内停顿最長约50ms-400ms，设 25 帧(750ms)绝过多数情况
-    MAX_SILENCE_FRAMES = 25
+    MAX_SILENCE_FRAMES = VAD_MAX_SILENCE_FRAMES
 
     current_speech_buffer = bytearray()
     cancel_event = asyncio.Event()
     current_llm_task: asyncio.Task | None = None  # 跟踪当前 LLM 任务，防止并发重复
 
+    current_image_data_url: str | None = None
     try:
         while True:
             message = await websocket.receive()
@@ -1080,8 +1121,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = message["bytes"]
                 audio_buffer.extend(data)
 
-                VOLUME_THRESHOLD = 450   # 经验值：键盘声≈200-400 RMS，正常说话≈400-1200 RMS
-                MIN_SPEECH_FRAMES = 12   # 12帧≈360ms，过滤短促噪音同时不误杀正常语速
+                VOLUME_THRESHOLD = VAD_VOLUME_THRESHOLD
+                MIN_SPEECH_FRAMES = VAD_MIN_SPEECH_FRAMES
                 while len(audio_buffer) >= FRAME_SIZE:
                     frame = bytes(audio_buffer[:FRAME_SIZE])
                     audio_buffer = bytearray(audio_buffer[FRAME_SIZE:])
@@ -1144,13 +1185,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if len(clean_text) > 0 and not is_hallucination:
                                     cancel_event.clear()
                                     speech_frames = 0  # 重置计数器，防止剩余帧重复触发
-                                    current_llm_task = asyncio.create_task(
-                                        process_llm_and_tts(
-                                            text, websocket, cancel_event,
-                                            is_typed=False,
-                                            latency_trace=latency_trace,
-                                        )
-                                    )
+                                    task = process_vision_and_tts(text, current_image_data_url, websocket, cancel_event) if current_image_data_url else process_llm_and_tts(text, websocket, cancel_event, is_typed=False, latency_trace=latency_trace)
+                                    current_llm_task = asyncio.create_task(task)
                                 else:
                                     if len(clean_text) > 0:
                                         print(f"[静音/幻觉过滤] 过滤掉疑似 Whisper 幻觉文本: '{text}'")
@@ -1169,7 +1205,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         await asyncio.sleep(0.05)
                         cancel_event.clear()
                         # 开始新的回答
-                        asyncio.create_task(process_llm_and_tts(user_text, websocket, cancel_event, is_typed=True))
+                        task = process_vision_and_tts(user_text, current_image_data_url, websocket, cancel_event, is_typed=True) if current_image_data_url else process_llm_and_tts(user_text, websocket, cancel_event, is_typed=True)
+                        current_llm_task = asyncio.create_task(task)
+                    elif payload.get("type") == "image_upload":
+                        current_image_data_url = validate_and_normalize_image(payload.get("data", ""))
+                        await websocket.send_text("IMAGE_READY")
+                    elif payload.get("type") == "image_clear":
+                        current_image_data_url = None
+                        await websocket.send_text("IMAGE_CLEARED")
                     elif payload.get("type") == "interrupt":
                         # 仅打断当前的语音和生成
                         cancel_event.set()

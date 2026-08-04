@@ -1,6 +1,6 @@
-# Low-Latency Voice AI Agent with Barge-In Control (voice_app_v3_realtime)
+# Browser-Based Interruptible Voice Dialogue System (voice_app_v3_realtime)
 
-> A browser-based voice AI agent with continuous microphone streaming, VAD-based turn detection, barge-in playback cancellation, streamed LLM text, path-aware Edge-TTS synthesis, DeepSeek Function Calling (11 tools), and AST sandbox security evaluation.
+> A browser-based voice dialogue system featuring WebSocket audio exchange, VAD-based user interruption, faster-whisper ASR, DeepSeek Function Calling, and response-path-aware Edge-TTS synthesis.
 
 ---
 
@@ -18,8 +18,9 @@
    - Offloads Whisper ASR inference to a thread pool to avoid blocking the main asyncio event loop.
 
 2. **Path-Aware TTS Pipeline**
-   - Ordinary, tool-free voice replies split streamed LLM output at safe clause boundaries and pre-synthesize segments concurrently for ordered playback.
-   - Replies after a tool call are collected and synthesized in one Edge-TTS request to avoid unnecessary inter-segment pauses.
+   - For ordinary responses, streamed LLM output is divided at safe sentence or clause boundaries.
+   - TTS tasks are started asynchronously in advance, and completed audio segments are sent in the original text order.
+   - After Function Calling, the complete final response is collected and synthesized as one segment.
 
 3. **VAD-Triggered Barge-In Playback Control**
    - Sustained user speech detected by WebRTC VAD plus an RMS gate sends a `START` signal and cancels the current LLM/TTS task.
@@ -40,35 +41,38 @@
 ## 🛠️ Architecture / システム構成
 
 ```text
-[Browser (Web Audio API)] ──(WebSocket / PCM stream)──► [FastAPI Server]
-                                                              │
-              ┌───────────────────────────────────────────────┴──────────────────────────────┐
-              ▼                                               ▼                              ▼
-   [webrtcvad + RMS gate]                       [faster-whisper (Thread Pool)]  [DeepSeek LLM Agent]
-   Turn detection                                Audio → Text (asyncio.to_thread)  Function Calling (11 Tools)
-   configurable threshold / frames                                                           │
-              │                                                                             ▼
-              │ START signal ──────────────────────────────────────────────► [Edge-TTS (path-aware)]
-              ▼                                                          normal: segments; tool: full reply
-   [Frontend stopAudio()]                                                                   │
-   Unbind onended → pause → revoke URL                                                     ▼
-                                                                               [WebSocket send_bytes]
+[Browser (Web Audio API)] -- WebSocket / PCM --> [FastAPI Server]
+       |                                              |
+       +--> [webrtcvad + RMS gate] --> turn detection |
+       |                                              +--> [faster-whisper / Thread Pool] --> text
+       |                                              +--> [DeepSeek LLM + 11 tools]
+       |                                              +--> [Edge-TTS]
+       |                                                   ordinary: segment pre-synthesis
+       |                                                   after tool call: full-reply synthesis
+       +<-- START: stop active audio and clear queue <-- [WebSocket events]
+```
+
+`main.py` initializes `faster-whisper` as `tiny / CPU / int8`. The active CTranslate2 path does not use Intel Arc or DirectML acceleration.
+
+## VAD defaults
+
+| Parameter | Current default |
+| --- | ---: |
+| `VAD_VOLUME_THRESHOLD` | 450 RMS |
+| `VAD_MIN_SPEECH_FRAMES` | 12 frames (approximately 360 ms) |
+| `VAD_MAX_SILENCE_FRAMES` | 25 frames (approximately 750 ms) |
 
 ## Voice-turn latency experiment markers
 
 For accepted voice turns, the server writes one JSON line prefixed with `[Latency]`.
-The record uses a monotonic clock and includes the VAD turn-end to ASR-done,
+The record uses a monotonic clock and includes VAD turn-end, ASR-done,
 first-LLM-text, first-TTS-segment-ready, first-audio-sent, and terminal-response
 milestones. `boundary` is always `server_websocket_send`: it does not measure
 browser queueing, decode, or audible playback time.
 
 Records distinguish the `direct` and `tool` reply paths, and report `completed`,
 `cancelled`, or `error`. They are instrumentation for controlled experiments,
-                                                                               Frontend Audio() plays
-```
-
-
-`main.py` currently initializes `faster-whisper` as `tiny / CPU / int8`. Intel Arc / DirectML acceleration is not claimed because the active CTranslate2 inference path does not use it.
+not a claim of end-to-end playback latency or a formally measured full-duplex system.
 ---
 
 ## 🚀 Quick Start / 起動方法

@@ -338,6 +338,8 @@
     <div id="input-wrap">
         <div id="input-area">
             <input type="text" id="chat-input" placeholder="给赛博管家发消息…" autocomplete="off">
+            <input id="image-input" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+            <button id="image-btn" type="button">图片</button>
             <button id="voice-btn">🎤 语音</button>
             <button id="send-btn">发送</button>
         </div>
@@ -348,6 +350,8 @@
         const chatInput = document.getElementById('chat-input');
         const sendBtn = document.getElementById('send-btn');
         const voiceBtn = document.getElementById('voice-btn');
+        const imageInput = document.getElementById('image-input');
+        const imageBtn = document.getElementById('image-btn');
         const voiceOverlay = document.getElementById('voice-overlay');
         const orb = document.getElementById('orb');
         const voiceStatusText = document.getElementById('voice-status-text');
@@ -422,6 +426,10 @@
                         setVoiceState("thinking", "🤔 整理结果中...");
 
                     } else if (event.data === "START") {
+                    } else if (event.data === "IMAGE_READY") {
+                        imageBtn.textContent = '图片已附加';
+                    } else if (event.data === "IMAGE_CLEARED") {
+                        imageBtn.textContent = '图片';
                         // 用户开始说话 → 立刻打断 AI 的音频播放
                         stopAudio();
                         setVoiceState("listening", "🎙️ 听您说话中...");
@@ -532,6 +540,23 @@
         }
 
         sendBtn.onclick = sendTextChat;
+        imageBtn.onclick = () => imageInput.click();
+        imageInput.onchange = () => {
+            const file = imageInput.files[0];
+            if (!file) return;
+            if (file.size > 5 * 1024 * 1024) {
+                alert('图片不能超过 5 MB');
+                imageInput.value = '';
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = () => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'image_upload', data: reader.result }));
+                }
+            };
+            reader.readAsDataURL(file);
+        };
         chatInput.onkeypress = (e) => { if (e.key === 'Enter') sendTextChat(); };
 
         // ==========================
